@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -8,6 +9,9 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/golang-jwt/jwt/v4"
 )
 
 type TokenResponse struct {
@@ -23,6 +27,17 @@ type ErrorResponse struct {
 }
 
 var tokens []string
+var jwtKey = []byte("my_secret_key")
+
+func main() {
+	http.HandleFunc("/login", loginHandler)
+	http.HandleFunc("/resource", basicAuth)
+	http.HandleFunc("/resource/bearer", resourceBearerHandler)
+	http.HandleFunc("/protected", jwtMiddleware(protectedHandler))
+
+	log.Println("Listening on :9000")
+	http.ListenAndServe(":9000", nil)
+}
 
 func basicAuth(w http.ResponseWriter, r *http.Request) {
 	username, password, ok := r.BasicAuth()
@@ -30,7 +45,7 @@ func basicAuth(w http.ResponseWriter, r *http.Request) {
 
 	if username != "admin" {
 		w.WriteHeader(http.StatusUnauthorized)
-		fmt.Fprintln(w, "Unathorized")
+		fmt.Fprintln(w, "Unauthorized")
 		return
 	}
 
@@ -42,26 +57,32 @@ func basicAuth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-func main() {
-	http.HandleFunc("GET /resource", basicAuth)
-	http.HandleFunc("GET /resource/bearer", resourceBearerHandler)
-	http.HandleFunc("GET /login", loginHandler)
-
-	log.Println("Listening the :9000")
-	http.ListenAndServe(":9000", nil)
-}
-
 func loginHandler(w http.ResponseWriter, r *http.Request) {
-	token, err := randomHex(20)
+	username := r.URL.Query().Get("username")
+	if username == "" {
+		http.Error(w, "username is required", http.StatusBadRequest)
+		return
+	}
+
+	role := "user"
+	if username == "admin" {
+		role = "admin"
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"username": username,
+		"role":     role,
+		"exp":      time.Now().Add(time.Hour * 1).Unix(),
+	})
+
+	tokenString, err := token.SignedString(jwtKey)
 	if err != nil {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	tokens = append(tokens, token)
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(TokenResponse{Token: token})
+	json.NewEncoder(w).Encode(TokenResponse{Token: tokenString})
 }
 
 func resourceBearerHandler(w http.ResponseWriter, r *http.Request) {
@@ -90,6 +111,55 @@ func resourceBearerHandler(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(ErrorResponse{Message: "unauthorized"})
 			return
 		}
+	}
+}
+
+func protectedHandler(w http.ResponseWriter, r *http.Request) {
+	user := r.Context().Value("user").(*jwt.Token)
+	claims := user.Claims.(jwt.MapClaims)
+	role := claims["role"].(string)
+
+	if role != "admin" {
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(ErrorResponse{Message: "forbidden"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(DataResponse{Data: "protected data"})
+}
+
+func jwtMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		bearerToken := r.Header.Get("Authorization")
+		if bearerToken == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(ErrorResponse{Message: "missing authorization header"})
+			return
+		}
+
+		splitToken := strings.Split(bearerToken, " ")
+		if len(splitToken) != 2 || strings.ToLower(splitToken[0]) != "bearer" {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(ErrorResponse{Message: "invalid authorization header format"})
+			return
+		}
+
+		tokenStr := splitToken[1]
+		claims := &jwt.MapClaims{}
+
+		token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
+			return jwtKey, nil
+		})
+
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(ErrorResponse{Message: "unauthorized"})
+			return
+		}
+
+		r = r.WithContext(context.WithValue(r.Context(), "user", token))
+		next(w, r)
 	}
 }
 
